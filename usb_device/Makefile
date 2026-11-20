@@ -23,7 +23,7 @@ endif
 
 FRAMEWORKS = -framework CoreFoundation -framework IOKit
 
-SOURCES = main.c alt_IOUSBDeviceControllerLib.c
+SOURCES = main.c alt_IOUSBDeviceControllerLib.c ports.c
 
 HEADERS = 
 

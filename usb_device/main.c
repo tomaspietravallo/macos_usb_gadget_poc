@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <poll.h>
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -13,6 +17,7 @@
 #include "alt_IOUSBDeviceControllerLib.h"
 
 #include "usb_hid_keys.h"
+#include "ports.h"
 
 CFStringRef serial = CFSTR("Look, Custom Serial");
 
@@ -28,20 +33,105 @@ const char* some_str = "keyboard_idk";
 
 volatile sig_atomic_t stop;
 
+static const char *selected_port;
+static unsigned char message[1024];
+static size_t message_len;
+static int live_mode;
+
+static int hid_key_for_ascii(unsigned char c, uint8_t *key, uint8_t *modifier)
+{
+    *modifier = 0;
+    if (c >= 'a' && c <= 'z') { *key = KEY_A + c - 'a'; return 1; }
+    if (c >= 'A' && c <= 'Z') { *key = KEY_A + c - 'A'; *modifier = 2; return 1; }
+    if (c >= '1' && c <= '9') { *key = KEY_1 + c - '1'; return 1; }
+    if (c == '0') { *key = KEY_0; return 1; }
+    if (c == ' ') { *key = KEY_SPACE; return 1; }
+    if (c == '\n' || c == '\r') { *key = KEY_ENTER; return 1; }
+    if (c == '\t') { *key = KEY_TAB; return 1; }
+    if (c == '\b' || c == 0x7f) { *key = KEY_BACKSPACE; return 1; }
+    if (c == 0x1b) { *key = KEY_ESC; return 1; }
+    const char *plain = "-=[]\\;',./`";
+    const char *shifted = "_+{}|:\"<>?~";
+    const uint8_t keys[] = {KEY_MINUS, KEY_EQUAL, KEY_LEFTBRACE, KEY_RIGHTBRACE,
+        KEY_BACKSLASH, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_COMMA, KEY_DOT,
+        KEY_SLASH, KEY_GRAVE};
+    for (size_t i = 0; i < sizeof(keys); i++) {
+        if (c == plain[i] || c == shifted[i]) {
+            *key = keys[i];
+            *modifier = c == shifted[i] ? 2 : 0;
+            return 1;
+        }
+    }
+    const char *shifted_digits = "!@#$%^&*()";
+    for (size_t i = 0; i < 10; i++) {
+        if (c == shifted_digits[i]) {
+            *key = i == 9 ? KEY_0 : KEY_1 + i;
+            *modifier = 2;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int read_message(void)
+{
+    int ch;
+    while ((ch = getchar()) != EOF) {
+        if (message_len == sizeof(message)) {
+            fprintf(stderr, "Text is too long (maximum 1024 bytes).\n");
+            return 1;
+        }
+        uint8_t key, modifier;
+        if (!hid_key_for_ascii((unsigned char)ch, &key, &modifier)) {
+            fprintf(stderr, "Unsupported character at byte %zu (0x%02x); use US ASCII text.\n",
+                message_len + 1, (unsigned char)ch);
+            return 1;
+        }
+        message[message_len++] = (unsigned char)ch;
+    }
+    if (ferror(stdin) || message_len == 0) {
+        fprintf(stderr, "No text was provided on standard input.\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int read_live_byte(void)
+{
+    unsigned char byte;
+    ssize_t count;
+    do {
+        count = read(STDIN_FILENO, &byte, 1);
+    } while (count < 0 && errno == EINTR && !stop);
+    return count == 1 ? byte : EOF;
+}
+
+static kern_return_t write_hid_report(io_connect_t data_port, void *buffer,
+                                      uint64_t pipe_id, uint64_t map_token,
+                                      const uint8_t report[8])
+{
+    uint64_t args[4] = {pipe_id, map_token, 8, 100};
+    uint64_t output = 0;
+    uint32_t output_count = 1;
+    memset(buffer, 0, 16);
+    memcpy(buffer, report, 8);
+    return IOConnectCallScalarMethod(data_port, 14, args, 4, &output, &output_count);
+}
+
 void inthand(int signum) {
     stop = 1;
 }
 
-void make_a_keyboard()
+int make_a_keyboard()
 {
     // TODO: A lot more error checking
     io_iterator_t       iter    = 0;
-    io_service_t service;
-    io_service_t service_kext;
+    io_service_t service = 0;
+    io_service_t service_kext = 0;
     kern_return_t s_ret;
     IOReturn ret;
 
-    io_connect_t dataPort;
+    io_connect_t dataPort = 0;
     io_connect_t dataPort_kext;
     kern_return_t open_ret;
 
@@ -64,7 +154,7 @@ void make_a_keyboard()
         CFRetain(match);
         ret = IOServiceGetMatchingServices(kIOMainPortDefault, match, &iter);
         if (ret != KERN_SUCCESS || iter == 0) {
-            printf("Error matching gay_bowser_usbgadget (%x)...\n", ret);
+            printf("No matching usbgadget service (%x)...\n", ret);
             sleep(1);
             continue;
         }
@@ -81,7 +171,7 @@ void make_a_keyboard()
                 continue;
             }
 
-            if (strstr(path, "usb-drd2")) {
+            if (strstr(path, selected_port)) {
                 printf("Connecting to: '%s'\n", path);
                 break;
             }
@@ -96,17 +186,29 @@ void make_a_keyboard()
     }
 
     if (!service_kext) {
-        printf("Failed to find gay_bowser_usbgadget, aborting...\n");
-        return;
+        fprintf(stderr, "usbgadget.kext is not loaded or did not match %s; aborting.\n", selected_port);
+        return 1;
     }
 
     //open_ret = IOServiceOpen(service_kext, mach_task_self(), 123, &dataPort_kext);
     //printf("open_ret kext %x %x\n", open_ret, dataPort_kext);
 
-    alt_IOUSBDeviceControllerCreateFromService(kCFAllocatorDefault, service_kext, &controller);
+    ret = alt_IOUSBDeviceControllerCreateFromService(kCFAllocatorDefault, service_kext, &controller);
+    if (ret != kIOReturnSuccess) {
+        fprintf(stderr, "Failed to create USB device controller (%x); aborting.\n", ret);
+        IOObjectRelease(service_kext);
+        return 1;
+    }
     //int configId = 0;
 #if 1
     alt_IOUSBDeviceDescriptionRef desc = alt_IOUSBDeviceDescriptionCreate(kCFAllocatorDefault);//alt_IOUSBDeviceDescriptionCreateFromController(kCFAllocatorDefault, controller);
+    if (!desc) {
+        fprintf(stderr, "Failed to create USB device description; aborting.\n");
+        IOObjectRelease(service_kext);
+        alt_IOUSBDeviceControllerRelease(controller);
+        CFAllocatorDeallocate(kCFAllocatorDefault, controller);
+        return 1;
+    }
     alt_IOUSBDeviceDescriptionSetSerialString(desc, serial);
 
     alt_IOUSBDeviceDescriptionSetProductID(desc, 0x1234);
@@ -124,6 +226,15 @@ void make_a_keyboard()
 
     ret = alt_IOUSBDeviceControllerSetDescription(controller, desc);
     printf("%x: system=%x subsystem=%x code=%x\n", ret, err_get_system(ret), err_get_sub(ret), err_get_code(ret));
+    if (ret != kIOReturnSuccess) {
+        fprintf(stderr, "Failed to set USB device description; aborting.\n");
+        IOObjectRelease(service_kext);
+        alt_IOUSBDeviceControllerRelease(controller);
+        CFAllocatorDeallocate(kCFAllocatorDefault, controller);
+        alt_IOUSBDeviceDescriptionRelease(desc);
+        CFAllocatorDeallocate(kCFAllocatorDefault, desc);
+        return 1;
+    }
 
     //printf("%x\n", IORegistryEntrySetCFProperty(service_kext, CFSTR("AAAA"), CFSTR("BBBB")));
 
@@ -176,7 +287,7 @@ void make_a_keyboard()
                 continue;
             }
 
-            if (strstr(path, "usb-drd2")) {
+            if (strstr(path, selected_port)) {
                 printf("Connecting to: '%s'\n", path);
                 break;
             }
@@ -191,13 +302,17 @@ void make_a_keyboard()
 
     if (!service) {
         printf("Failed to find IOUSBDeviceInterface, aborting...\n");
-        return;
+        return 1;
     }
 
     open_ret = IOServiceOpen(service, mach_task_self(), 123, &dataPort);
     printf("open_ret %x %x\n", open_ret, dataPort);
     //IOServiceClose(service);
     IOObjectRelease(service);
+    if (open_ret != KERN_SUCCESS) {
+        fprintf(stderr, "Failed to open USB device interface; aborting.\n");
+        return 1;
+    }
 
     
     // Open
@@ -329,14 +444,15 @@ void make_a_keyboard()
     args[0] = 0x1000;
     s_ret = IOConnectCallScalarMethod(dataPort, 18, args, 1, output, &outputCount);
     printf("createData s_ret %x %x (%llx %llx %llx)\n", s_ret, outputCount, output[0], output[1], output[2]);
+    if (s_ret != KERN_SUCCESS || outputCount < 3 || output[0] == 0) {
+        fprintf(stderr, "Failed to allocate USB report buffer; aborting.\n");
+        IOServiceClose(dataPort);
+        return 1;
+    }
 
     void* dataptr = (void*)output[0];
     uint64_t data_cap = output[1];
     uint64_t map_token = output[2];
-
-    int enum_waits = 0;
-    int idx = 0;
-    uint8_t type_stuff[] = {KEY_M, KEY_Y, KEY_SPACE, KEY_L, KEY_A, KEY_P, KEY_T, KEY_O, KEY_P, KEY_SPACE, KEY_I, KEY_S, KEY_SPACE, KEY_A, KEY_SPACE, KEY_K, KEY_E, KEY_Y, KEY_B, KEY_O, KEY_A, KEY_R, KEY_D, KEY_DOT, KEY_SPACE};
 
     // Force the device to re-enumerate
     //IOUSBDeviceControllerGoOffAndOnBus(controller, 1000);
@@ -350,71 +466,111 @@ void make_a_keyboard()
     printf("map s_ret %x %x (%llx %llx %llx)\n", s_ret, outputCount, output[0], output[1], output[2]);
 #endif
 
-#if 1
-    while (!stop)
-    {
-        
-        uint8_t test_send[8] = {0x0, 0x0, type_stuff[idx], 0x0, 0x0, 0x0, 0x0, 0x0};
-        //uint8_t test_send[8] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
-        uint8_t test_send_2[8] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
-
-        //printf("%p\n", dataptr);
-        memset(dataptr, 0, 0x10);
-        memcpy(dataptr, test_send, sizeof(test_send));
-
-        // 0xE0000001 = Device not enumerated
-        // 0xE00002D6 = Send timed out
-        // WritePort - press the key
-        outputCount = 1; // bytes written
-        args[0] = pipe_id;
-        args[1] = map_token;
-        args[2] = sizeof(test_send);
-        args[3] = 100; // timeout ms?
-        s_ret = IOConnectCallScalarMethod(dataPort, 14, args, 4, output, &outputCount);
-        printf("write s_ret %x (%llx)\n", s_ret, output[0]);
-
-        if (s_ret == 0xE0000001) {
-            printf("Waiting for device enumeration...\n");
-
-            if (enum_waits++ > 5) {
-                // Force the device to re-enumerate
-                //IOUSBDeviceControllerGoOffAndOnBus(controller, 1000);
-
-                enum_waits = 0;
-            }
-
-            sleep(1);
-            continue;
-        }
-        else if (s_ret == 0xE00002D6) {
-            printf("Write timed out.\n");
-            sleep(1);
-            continue;
-        }
-        else if (s_ret & 0xFFFF0000)
-        {
-            printf("Unknown error.\n");
-            sleep(1);
-        }
-
-        // Write Port - Un-press the key
-        //printf("%p\n", dataptr);
-        //memset(dataptr, 0, 0x10);
-        memcpy(dataptr, test_send_2, sizeof(test_send_2));
-        args[0] = pipe_id;
-        args[1] = map_token;
-        args[2] = sizeof(test_send_2);
-        args[3] = 100; // timeout ms?
-        s_ret = IOConnectCallScalarMethod(dataPort, 14, args, 4, output, &outputCount);
-        printf("write s_ret %x (%llx)\n", s_ret, output[0]);
-
-        idx++;
-        if (idx >= sizeof(type_stuff)) {
-            idx = 0;
-            sleep(1);
-        }
+    int send_failed = 0;
+    size_t sent_count = 0;
+    uint8_t held_report[8] = {0};
+    int holding = 0;
+    kern_return_t last_hold_error = KERN_SUCCESS;
+    if (live_mode) {
+        puts("READY");
+        fflush(stdout);
     }
-#endif
+    while (!stop) {
+        unsigned char character;
+        if (live_mode) {
+            struct pollfd input = {.fd = STDIN_FILENO, .events = POLLIN};
+            int ready = poll(&input, 1, holding ? 100 : -1);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                perror("poll");
+                send_failed = 1;
+                break;
+            }
+            if (ready == 0) {
+                s_ret = write_hid_report(dataPort, dataptr, pipe_id, map_token, held_report);
+                if (s_ret != last_hold_error) {
+                    if (s_ret == KERN_SUCCESS) puts("Held key resumed after USB reconnection.");
+                    else fprintf(stderr, "Held key is waiting for USB host (0x%x).\n", s_ret);
+                    fflush(stdout);
+                    last_hold_error = s_ret;
+                }
+                continue;
+            }
+            int next = read_live_byte();
+            if (next == EOF) break;
+            if (next == 1) {
+                int key = read_live_byte();
+                int modifier = read_live_byte();
+                if (key == EOF || modifier == EOF) {
+                    fprintf(stderr, "Incomplete hold command.\n");
+                    send_failed = 1;
+                    break;
+                }
+                memset(held_report, 0, sizeof(held_report));
+                held_report[0] = (uint8_t)modifier;
+                held_report[2] = (uint8_t)key;
+                holding = 1;
+                s_ret = write_hid_report(dataPort, dataptr, pipe_id, map_token, held_report);
+                last_hold_error = s_ret;
+                if (s_ret != KERN_SUCCESS)
+                    fprintf(stderr, "Held key is waiting for USB host (0x%x).\n", s_ret);
+                printf("Holding HID key 0x%02x with modifier 0x%02x.\n", key, modifier);
+                fflush(stdout);
+                continue;
+            }
+            if (next == 2) {
+                memset(held_report, 0, sizeof(held_report));
+                holding = 0;
+                s_ret = write_hid_report(dataPort, dataptr, pipe_id, map_token, held_report);
+                if (s_ret != KERN_SUCCESS)
+                    fprintf(stderr, "Host was disconnected when held key was released (0x%x).\n", s_ret);
+                last_hold_error = KERN_SUCCESS;
+                puts("Released held key.");
+                fflush(stdout);
+                continue;
+            }
+            if (holding) {
+                fprintf(stderr, "Release the held key before typing text.\n");
+                fflush(stderr);
+                continue;
+            }
+            character = (unsigned char)next;
+        } else {
+            if (sent_count >= message_len) break;
+            character = message[sent_count];
+        }
+        uint8_t key, modifier;
+        if (!hid_key_for_ascii(character, &key, &modifier)) {
+            fprintf(stderr, "Unsupported live character: 0x%02x\n", character);
+            send_failed = 1;
+            break;
+        }
+        uint8_t report[8] = {modifier, 0, key, 0, 0, 0, 0, 0};
+        int attempts = 0;
+        do {
+            s_ret = write_hid_report(dataPort, dataptr, pipe_id, map_token, report);
+            if (s_ret == 0xE0000001 && attempts++ < 10) sleep(1);
+            else break;
+        } while (!stop);
+        if (s_ret != KERN_SUCCESS) {
+            fprintf(stderr, "Key %zu could not be sent: 0x%x\n", sent_count + 1, s_ret);
+            send_failed = 1;
+            break;
+        }
+        uint8_t released[8] = {0};
+        s_ret = write_hid_report(dataPort, dataptr, pipe_id, map_token, released);
+        if (s_ret != KERN_SUCCESS) {
+            fprintf(stderr, "Key %zu could not be released: 0x%x\n", sent_count + 1, s_ret);
+            send_failed = 1;
+            break;
+        }
+        sent_count++;
+    }
+
+    if (holding) {
+        uint8_t released[8] = {0};
+        write_hid_report(dataPort, dataptr, pipe_id, map_token, released);
+    }
 
     // ReleaseBuffer
     outputCount = 0;
@@ -432,11 +588,28 @@ void make_a_keyboard()
     IOServiceClose(dataPort);
 
     //mach_port_mod_refs(mach_task_self(), wakePort, MACH_PORT_RIGHT_RECEIVE, -1);
+    if (stop) return 130;
+    if (send_failed) return 1;
+    printf("Submitted %zu key events to %s. Verify delivery on the receiving computer.\n",
+        sent_count, selected_port);
+    return 0;
 }
 
-int main()
+int main(int argc, char **argv)
 {
     signal(SIGINT, inthand);
-    
-    make_a_keyboard();
+    if (argc == 2 && strcmp(argv[1], "--list") == 0) return list_usb_ports();
+    if (argc == 4 && strcmp(argv[1], "--live") == 0 &&
+            strcmp(argv[2], "--port") == 0 && valid_usb_port(argv[3])) {
+        live_mode = 1;
+        selected_port = argv[3];
+        return make_a_keyboard();
+    }
+    if (argc != 3 || strcmp(argv[1], "--port") != 0 || !valid_usb_port(argv[2])) {
+        fprintf(stderr, "Usage: %s --list | --port usb-drdN < text.txt | --live --port usb-drdN\n", argv[0]);
+        return 2;
+    }
+    selected_port = argv[2];
+    if (read_message()) return 2;
+    return make_a_keyboard();
 }

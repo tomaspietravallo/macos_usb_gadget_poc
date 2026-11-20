@@ -57,7 +57,7 @@ static alt_IOUSBDeviceControllerRef __deviceRefFromService(CFAllocatorRef alloca
     bzero(offset, size);
     
 	device->deviceIOService = service;
-	//IOObjectRetain(service);
+    IOObjectRetain(service);
     return device;
 }
 
